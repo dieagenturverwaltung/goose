@@ -1,17 +1,23 @@
 package clickhouse_test
 
 import (
-	"database/sql"
-	"errors"
+	"log"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/avast/retry-go/v4"
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/internal/check"
 	"github.com/pressly/goose/v3/internal/testdb"
 )
+
+func TestMain(m *testing.M) {
+	if err := goose.SetDialect("clickhouse"); err != nil {
+		log.Fatal(err)
+	}
+	os.Exit(m.Run())
+}
 
 func TestClickUpDownAll(t *testing.T) {
 	t.Parallel()
@@ -20,18 +26,6 @@ func TestClickUpDownAll(t *testing.T) {
 	db, cleanup, err := testdb.NewClickHouse()
 	check.NoError(t, err)
 	t.Cleanup(cleanup)
-
-	goose.SetDialect("clickhouse")
-
-	retryCheckTableMutation := func(table string) func() error {
-		return func() error {
-			ok := checkTableMutation(t, db, table)
-			if !ok {
-				return errors.New("mutation not done for table: " + table)
-			}
-			return nil
-		}
-	}
 
 	/*
 		This test applies all up migrations, asserts we have all the entries in
@@ -69,11 +63,6 @@ func TestClickUpDownAll(t *testing.T) {
 
 	err = goose.DownTo(db, migrationDir, 0)
 	check.NoError(t, err)
-	err = retry.Do(
-		retryCheckTableMutation(goose.TableName()),
-		retry.Delay(1*time.Second),
-	)
-	check.NoError(t, err)
 
 	currentVersion, err = goose.GetDBVersion(db)
 	check.NoError(t, err)
@@ -87,8 +76,6 @@ func TestClickHouseFirstThree(t *testing.T) {
 	db, cleanup, err := testdb.NewClickHouse()
 	check.NoError(t, err)
 	t.Cleanup(cleanup)
-
-	goose.SetDialect("clickhouse")
 
 	err = goose.Up(db, migrationDir)
 	check.NoError(t, err)
@@ -158,8 +145,6 @@ func TestRemoteImportMigration(t *testing.T) {
 	check.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	goose.SetDialect("clickhouse")
-
 	err = goose.Up(db, migrationDir)
 	check.NoError(t, err)
 	_, err = goose.GetDBVersion(db)
@@ -169,41 +154,4 @@ func TestRemoteImportMigration(t *testing.T) {
 	err = db.QueryRow(`SELECT count(*) FROM taxi_zone_dictionary`).Scan(&count)
 	check.NoError(t, err)
 	check.Number(t, count, 265)
-}
-
-func checkTableMutation(t *testing.T, db *sql.DB, tableName string) bool {
-	t.Helper()
-	rows, err := db.Query(
-		`select mutation_id, command, is_done, create_time from system.mutations where table=$1`,
-		tableName,
-	)
-	check.NoError(t, err)
-
-	type result struct {
-		mutationID string    `db:"mutation_id"`
-		command    string    `db:"command"`
-		isDone     int64     `db:"is_done"`
-		createTime time.Time `db:"create_time"`
-	}
-	var results []result
-	for rows.Next() {
-		var r result
-		err = rows.Scan(&r.mutationID, &r.command, &r.isDone, &r.createTime)
-		check.NoError(t, err)
-		results = append(results, r)
-	}
-	check.NoError(t, rows.Close())
-	check.NoError(t, rows.Err())
-	// No results means there are no mutations. Assume they are all done.
-	if len(results) == 0 {
-		return true
-	}
-	// Loop through all the mutations, if at least one of them is
-	// not done, return false.
-	for _, r := range results {
-		if r.isDone != 1 {
-			return false
-		}
-	}
-	return true
 }

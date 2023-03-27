@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pressly/goose/v3/internal/check"
 	_ "modernc.org/sqlite"
 )
 
@@ -135,7 +136,7 @@ func TestCustomBinary(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		if err := os.Remove("./go.db"); err != nil {
-			t.Logf("failed to remove %s resouces: %v", t.Name(), err)
+			t.Logf("failed to remove %s resources: %v", t.Name(), err)
 		}
 	})
 
@@ -159,7 +160,7 @@ func TestEmbeddedMigrations(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		if err := os.Remove("./sql_embed.db"); err != nil {
-			t.Logf("failed to remove %s resouces: %v", t.Name(), err)
+			t.Logf("failed to remove %s resources: %v", t.Name(), err)
 		}
 	})
 
@@ -172,7 +173,7 @@ func TestEmbeddedMigrations(t *testing.T) {
 	}
 
 	SetBaseFS(fsys)
-	SetDialect("sqlite3")
+	check.NoError(t, SetDialect("sqlite3"))
 	t.Cleanup(func() { SetBaseFS(nil) })
 
 	t.Run("Migration cycle", func(t *testing.T) {

@@ -7,15 +7,23 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
+	"sort"
+	"strconv"
+	"strings"
+	"text/tabwriter"
 	"text/template"
 
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/internal/cfg"
+	"github.com/pressly/goose/v3/internal/migrationstats"
+	"github.com/pressly/goose/v3/internal/migrationstats/migrationstatsos"
 )
 
 var (
 	flags        = flag.NewFlagSet("goose", flag.ExitOnError)
-	dir          = flags.String("dir", defaultMigrationDir, "directory with migration files")
+	dir          = flags.String("dir", cfg.DefaultMigrationDir, "directory with migration files")
 	table        = flags.String("table", "goose_db_version", "migrations table name")
 	verbose      = flags.Bool("v", false, "enable verbose mode")
 	help         = flags.Bool("h", false, "print help")
@@ -26,6 +34,7 @@ var (
 	sslcert      = flags.String("ssl-cert", "", "file path to SSL certificates in pem format (only support on mysql)")
 	sslkey       = flags.String("ssl-key", "", "file path to SSL key in pem format (only support on mysql)")
 	noVersioning = flags.Bool("no-versioning", false, "apply migration commands with no versioning, in file order, from directory pointed to")
+	noColor      = flags.Bool("no-color", false, "disable color output (NO_COLOR env variable supported)")
 )
 var (
 	gooseVersion = ""
@@ -33,7 +42,10 @@ var (
 
 func main() {
 	flags.Usage = usage
-	flags.Parse(os.Args[1:])
+	if err := flags.Parse(os.Args[1:]); err != nil {
+		log.Fatalf("failed to parse args: %v", err)
+		return
+	}
 
 	if *version {
 		if buildInfo, ok := debug.ReadBuildInfo(); ok && buildInfo != nil && gooseVersion == "" {
@@ -51,14 +63,21 @@ func main() {
 	goose.SetTableName(*table)
 
 	args := flags.Args()
-	if len(args) == 0 || *help {
+
+	if *help {
 		flags.Usage()
 		return
 	}
+
+	if len(args) == 0 {
+		flags.Usage()
+		os.Exit(1)
+	}
+
 	// The -dir option has not been set, check whether the env variable is set
 	// before defaulting to ".".
-	if *dir == defaultMigrationDir && os.Getenv(envGooseMigrationDir) != "" {
-		*dir = os.Getenv(envGooseMigrationDir)
+	if *dir == cfg.DefaultMigrationDir && cfg.GOOSEMIGRATIONDIR != "" {
+		*dir = cfg.GOOSEMIGRATIONDIR
 	}
 
 	switch args[0] {
@@ -77,21 +96,33 @@ func main() {
 			log.Fatalf("goose run: %v", err)
 		}
 		return
+	case "env":
+		for _, env := range cfg.List() {
+			fmt.Printf("%s=%q\n", env.Name, env.Value)
+		}
+		return
+	case "validate":
+		if err := printValidate(*dir, *verbose); err != nil {
+			log.Fatalf("goose validate: %v", err)
+		}
+		return
 	}
 
 	args = mergeArgs(args)
 	if len(args) < 3 {
 		flags.Usage()
-		return
+		os.Exit(1)
 	}
 
 	driver, dbstring, command := args[0], args[1], args[2]
-	// To avoid breaking existing consumers, treat sqlite3 as sqlite.
-	// An implementation detail that consumers should not care which
-	// underlying driver is used. Internally uses the CGo-free port
-	// of SQLite: modernc.org/sqlite
-	if driver == "sqlite3" {
+	// To avoid breaking existing consumers. An implementation detail
+	// that consumers should not care which underlying driver is used.
+	switch driver {
+	case "sqlite3":
+		//  Internally uses the CGo-free port of SQLite: modernc.org/sqlite
 		driver = "sqlite"
+	case "postgres":
+		driver = "pgx"
 	}
 	db, err := goose.OpenDBWithDriver(driver, normalizeDBString(driver, dbstring, *certfile, *sslcert, *sslkey))
 	if err != nil {
@@ -107,8 +138,10 @@ func main() {
 	if len(args) > 3 {
 		arguments = append(arguments, args[3:]...)
 	}
-
 	options := []goose.OptionsFunc{}
+	if *noColor || checkNoColorFromEnv() {
+		options = append(options, goose.WithNoColor(true))
+	}
 	if *allowMissing {
 		options = append(options, goose.WithAllowMissing())
 	}
@@ -126,25 +159,20 @@ func main() {
 	}
 }
 
-const (
-	envGooseDriver       = "GOOSE_DRIVER"
-	envGooseDBString     = "GOOSE_DBSTRING"
-	envGooseMigrationDir = "GOOSE_MIGRATION_DIR"
-)
-
-const (
-	defaultMigrationDir = "."
-)
+func checkNoColorFromEnv() bool {
+	ok, _ := strconv.ParseBool(cfg.GOOSENOCOLOR)
+	return ok
+}
 
 func mergeArgs(args []string) []string {
 	if len(args) < 1 {
 		return args
 	}
-	if d := os.Getenv(envGooseDriver); d != "" {
-		args = append([]string{d}, args...)
+	if s := cfg.GOOSEDRIVER; s != "" {
+		args = append([]string{s}, args...)
 	}
-	if d := os.Getenv(envGooseDBString); d != "" {
-		args = append([]string{args[0], d}, args[1:]...)
+	if s := cfg.GOOSEDBSTRING; s != "" {
+		args = append([]string{args[0], s}, args[1:]...)
 	}
 	return args
 }
@@ -174,6 +202,7 @@ Drivers:
     redshift
     tidb
     clickhouse
+    vertica
 
 Examples:
     goose sqlite3 ./foo.db status
@@ -188,6 +217,7 @@ Examples:
     goose tidb "user:password@/dbname?parseTime=true" status
     goose mssql "sqlserver://user:password@dbname:1433?database=master" status
     goose clickhouse "tcp://127.0.0.1:9000" status
+    goose vertica "vertica://user:password@localhost:5433/dbname?connection_load_balance=1" status
 
     GOOSE_DRIVER=sqlite3 GOOSE_DBSTRING=./foo.db goose status
     GOOSE_DRIVER=sqlite3 GOOSE_DBSTRING=./foo.db goose create init sql
@@ -223,14 +253,14 @@ var sqlMigrationTemplate = template.Must(template.New("goose.sql-migration").Par
 --
 -- A single goose .sql file holds both Up and Down migrations.
 -- 
--- All goose .sql files are expected to have a -- +goose Up directive.
--- The -- +goose Down directive is optional, but recommended, and must come after the Up directive.
+-- All goose .sql files are expected to have a -- +goose Up annotation.
+-- The -- +goose Down annotation is optional, but recommended, and must come after the Up annotation.
 -- 
--- The -- +goose NO TRANSACTION directive may be added to the top of the file to run statements 
+-- The -- +goose NO TRANSACTION annotation may be added to the top of the file to run statements 
 -- outside a transaction. Both Up and Down migrations within this file will be run without a transaction.
 -- 
 -- More complex statements that have semicolons within them must be annotated with 
--- the -- +goose StatementBegin and -- +goose StatementEnd directives to be properly recognized.
+-- the -- +goose StatementBegin and -- +goose StatementEnd annotations to be properly recognized.
 -- 
 -- Use GitHub issues for reporting bugs and requesting features, enjoy!
 
@@ -243,7 +273,7 @@ SELECT 'down SQL query';
 
 // initDir will create a directory with an empty SQL migration file.
 func gooseInit(dir string) error {
-	if dir == "" || dir == defaultMigrationDir {
+	if dir == "" || dir == cfg.DefaultMigrationDir {
 		dir = "migrations"
 	}
 	_, err := os.Stat(dir)
@@ -258,4 +288,60 @@ func gooseInit(dir string) error {
 		return err
 	}
 	return goose.CreateWithTemplate(nil, dir, sqlMigrationTemplate, "initial", "sql")
+}
+
+func gatherFilenames(filename string) ([]string, error) {
+	stat, err := os.Stat(filename)
+	if err != nil {
+		return nil, err
+	}
+	var filenames []string
+	if stat.IsDir() {
+		for _, pattern := range []string{"*.sql", "*.go"} {
+			file, err := filepath.Glob(filepath.Join(filename, pattern))
+			if err != nil {
+				return nil, err
+			}
+			filenames = append(filenames, file...)
+		}
+	} else {
+		filenames = append(filenames, filename)
+	}
+	sort.Strings(filenames)
+	return filenames, nil
+}
+
+func printValidate(filename string, verbose bool) error {
+	filenames, err := gatherFilenames(filename)
+	if err != nil {
+		return err
+	}
+	fileWalker := migrationstatsos.NewFileWalker(filenames...)
+	stats, err := migrationstats.GatherStats(fileWalker, false)
+	if err != nil {
+		return err
+	}
+	// TODO(mf): we should introduce a --debug flag, which allows printing
+	// more internal debug information and leave verbose for additional information.
+	if !verbose {
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', tabwriter.TabIndent)
+	fmtPattern := "%v\t%v\t%v\t%v\t%v\t\n"
+	fmt.Fprintf(w, fmtPattern, "Type", "Txn", "Up", "Down", "Name")
+	fmt.Fprintf(w, fmtPattern, "────", "───", "──", "────", "────")
+	for _, m := range stats {
+		txnStr := "✔"
+		if !m.Tx {
+			txnStr = "✘"
+		}
+		fmt.Fprintf(w, fmtPattern,
+			strings.TrimPrefix(filepath.Ext(m.FileName), "."),
+			txnStr,
+			m.UpCount,
+			m.DownCount,
+			filepath.Base(m.FileName),
+		)
+	}
+	return w.Flush()
 }
